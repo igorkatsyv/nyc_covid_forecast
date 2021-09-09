@@ -1,0 +1,238 @@
+
+---
+output:
+  pdf_document: default
+  html_document: default
+---
+#### Report SARS-CoV-2 Incidence ####
+
+---
+title: "SARS-CoV-2 Incidence Projection" #
+
+output:
+  pdf_document: default
+---
+  
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = F, warning = F, results = F, dpi = 600) # set parameters for generating final report
+rm(list=ls())
+setwd('/Users/ikatsyv/Dropbox/nyc_covid_incidence')
+
+# load software libraries we will need
+library(ggplot2)
+library(incidence) 
+library(EpiEstim)
+library(projections)
+library(magrittr)
+library(splitstackshape)
+library(data.table)
+library(forecast)
+
+options(stringsAsFactors = FALSE)
+
+```
+
+
+### New York City Department of Health
+
+```{r, fig.width = 8, fig.height = 5}
+library(choroplethrZip)
+
+nyc_byzip = read.delim('https://raw.githubusercontent.com/nychealth/coronavirus-data/master/totals/data-by-modzcta.csv', sep = ',')
+names(nyc_byzip)[c(1,9)] = c('region','value')
+nyc_byzip$region = as.character(nyc_byzip$region)
+nyc_byzip$value = as.numeric(nyc_byzip$value)
+
+zip_choropleth(nyc_byzip[,c(1,9)],
+               zip_zoom = nyc_byzip$region,
+               # zip_zoom = nyc_byzip$region[nyc_byzip$BOROUGH_GROUP == 'Manhattan'],
+               title = paste('Cumulative NYC COVID-19 Cases As of ', Sys.Date(), sep = ''),
+               legend = 'Cases per 100,000')
+
+```
+
+
+```{r}
+# Model estimation function
+estimate_model = function(incidence, mu, sigma, start_date, days_out, quantiles) { # incidence = incidence object; start_date = from when to count incidence; quantiles = quantiles to break simulations 
+  require(incidence)
+  require(EpiEstim)
+  require(ggplot2)
+  require(projections)
+  require(magrittr)
+  require(splitstackshape)
+  require(data.table)
+  require(forecast)
+  
+  
+  # Set default values
+  if (missing(mu)) {
+    mu = 3.96
+  }
+  
+  if (missing(sigma)) {
+    sigma = 4.75
+  }
+  
+  if (missing(start_date)) {
+    start_date = min(incidence$dates)
+  }
+  
+  if (missing(days_out)) {
+    days_out = 7
+  }
+  
+  if (missing(quantiles)) {
+    quantiles = c(0.01, 0.05, 0.1, 0.5, 0.9, 0.95, 0.99)
+  }
+  
+  # index each date in incidence data, beginning from start of dataset
+  daycount = data.frame(dates = incidence$dates[order(incidence$dates)], day = seq(1:length(incidence$dates)))
+  
+  # for subsequent analyses, restrict daycount and incidence data to after and including start_date
+  daycount = daycount[daycount$dates >= as.Date(start_date),] 
+  incid = incidence[daycount$day[1]:max(daycount$day)]
+  
+  # estimate R given mu and sigma using default 7-day intervals
+  res = estimate_R(incid, method = 'parametric_si', config = make_config(list(mean_si = mu, std_si = sigma))) 
+  
+  # create projections based on each 7-day R interval
+  model = vector(mode = 'list', length = nrow(res$R))
+  for (i in 1:nrow(res$R)) {
+    model[[i]] = data.frame(project(incid[res$R$t_start[i]:res$R$t_end[i]], R = res$R$`Median(R)`[i], si = res$si_distr, n_days = days_out, model = 'poisson'))
+  }
+  model_sum = vector(mode = 'list', length = length(model))
+  for (i in 1:length(model)) {
+    model_sum[[i]] = cbind(dates = as.Date(model[[i]]$dates), 
+                           data.frame(t(apply(model[[i]][,2:ncol(model[[i]])], 1, 
+                                              function(x) quantile(x, probs = quantiles)))))
+    names(model_sum[[i]])[2:ncol(model_sum[[i]])] = gsub('X','q',names(model_sum[[i]][2:ncol(model_sum[[i]])]))
+    names(model_sum[[i]])[2:ncol(model_sum[[i]])] = gsub('\\.','',names(model_sum[[i]][2:ncol(model_sum[[i]])]))
+    model_sum[[i]]$I = incid$counts[match(model_sum[[i]]$dates, incid$dates)]
+  } 
+  
+  # remove all intervals containing future dates
+  incomplete_intervals = sapply(model_sum, function(x) any(x$dates >= Sys.Date()))
+  model_sum = model_sum[-(which(incomplete_intervals))]
+  
+  # set up lists to hold model accuracy measures
+  model_me = data.frame(q1 = numeric(), q5 = numeric(), q10 = numeric(), q50 = numeric(), q90 = numeric(), q95 = numeric(), q99 = numeric())
+  model_rmse = data.frame(q1 = numeric(), q5 = numeric(), q10 = numeric(), q50 = numeric(), q90 = numeric(), q95 = numeric(), q99 = numeric())
+  model_mae = data.frame(q1 = numeric(), q5 = numeric(), q10 = numeric(), q50 = numeric(), q90 = numeric(), q95 = numeric(), q99 = numeric())
+  model_mpe = data.frame(q1 = numeric(), q5 = numeric(), q10 = numeric(), q50 = numeric(), q90 = numeric(), q95 = numeric(), q99 = numeric())
+  model_mape = data.frame(q1 = numeric(), q5 = numeric(), q10 = numeric(), q50 = numeric(), q90 = numeric(), q95 = numeric(), q99 = numeric())
+  model_relrmse = data.frame(q1 = numeric(), q5 = numeric(), q10 = numeric(), q50 = numeric(), q90 = numeric(), q95 = numeric(), q99 = numeric())
+  
+  # compute model accuracy measures
+  for (i in 1:length(model_sum)) {
+    model_me[i,] = apply(model_sum[[i]][,2:(ncol(model_sum[[i]])-1)], 2, function(x) accuracy(x, model_sum[[i]]$I)[1])
+    model_rmse[i,] = apply(model_sum[[i]][,2:(ncol(model_sum[[i]])-1)], 2, function(x) accuracy(x, model_sum[[i]]$I)[2])
+    model_mae[i,] = apply(model_sum[[i]][,2:(ncol(model_sum[[i]])-1)], 2, function(x) accuracy(x, model_sum[[i]]$I)[3])
+    model_mpe[i,] = apply(model_sum[[i]][,2:(ncol(model_sum[[i]])-1)], 2, function(x) accuracy(x, model_sum[[i]]$I)[4])
+    model_mape[i,] = apply(model_sum[[i]][,2:(ncol(model_sum[[i]])-1)], 2, function(x) accuracy(x, model_sum[[i]]$I)[5])
+    model_relrmse[i,] = apply(model_sum[[i]][,2:ncol(model_sum[[i]]-1)], 2, function(x) (accuracy(x, model_sum[[i]]$I)[5]*100)/mean(model_sum[[i]]$I))
+  }
+  
+  row.names(model_me) = sapply(model_sum, function(x) paste(min(x$dates), '_to_', max(x$dates), sep = ''))
+  row.names(model_rmse) = sapply(model_sum, function(x) paste(min(x$dates), '_to_', max(x$dates), sep = ''))
+  row.names(model_mae) = sapply(model_sum, function(x) paste(min(x$dates), '_to_', max(x$dates), sep = ''))
+  row.names(model_mpe) = sapply(model_sum, function(x) paste(min(x$dates), '_to_', max(x$dates), sep = ''))
+  row.names(model_mape) = sapply(model_sum, function(x) paste(min(x$dates), '_to_', max(x$dates), sep = ''))
+  row.names(model_relrmse) = sapply(model_sum, function(x) paste(min(x$dates), '_to_', max(x$dates), sep = ''))
+  
+  
+  # combine accuracy measures into single list
+  model_accuracy = list(ME = model_me, RMSE = model_rmse, MAE = model_mae, MPE = model_mpe, MAPE = model_mape, rRMSE = model_relrmse)
+  
+  ## create plot objects
+  
+  # Incidence
+  incidence.plot = plot(incidence, border = 'white') + theme_bw()
+  
+  # R estimate
+  r.plot = plot(res, legend = T, 'R') + theme_bw() # plot R estimates
+  
+  # Existing incidence data with overlaid projections
+  pred.plot = plot(incidence) %>% 
+    add_projections(project(incidence, 
+                            R = res$R$`Median(R)`[nrow(res$R)], 
+                            si = res$si_distr, 
+                            n_days = days_out, 
+                            model = 'poisson'), 
+                    boxplots = T) + 
+    theme(axis.text = element_text(size=6)) + 
+    theme_bw()
+  
+  # Error
+  model_mape2 = data.frame(Interval = row.names(model_mape), model_mape)
+  model_mape2_melt = melt(model_mape2)
+  model_mape2_melt$Indicator = 'MAPE'
+  
+  model_relrmse2 = data.frame(Interval = row.names(model_relrmse), model_relrmse)
+  model_relrmse2_melt = melt(model_relrmse2)
+  model_relrmse2_melt$Indicator = 'rRMSE'
+  
+  model_error = rbind(model_mape2_melt, model_relrmse2_melt)
+  
+  names(model_error)[2:3] = c('Quantile', 'Error')
+  
+  error.heatmap = ggplot(model_error, aes(Interval, Quantile, fill = Error)) +
+    geom_tile(alpha = 1, height = 0.8, width = 0.85) +
+    theme_minimal() +
+    facet_wrap(~ model_error$Indicator, ncol = 2)+
+    theme(panel.grid.major = element_blank(), 
+          panel.grid.minor = element_blank(),
+          axis.text = element_text(size = 6, face = 'bold'),
+          legend.title = element_text(size = 10),
+          axis.title = element_text(size = 10),
+          plot.title = element_text(face = 'bold'),
+          legend.text = element_text(size = 10),
+          axis.text.x = element_text(angle = 65, hjust = 1)) +
+    scale_fill_continuous(trans = 'reverse', type = 'viridis')
+  
+  
+  # Summarize data
+  model_summary = list(model, model_sum, model_accuracy, incidence.plot, r.plot, pred.plot, error.heatmap)
+  names(model_summary) = c('model', 'model_sum', 'model_accuracy', 'incidence.plot', 'r.plot', 'pred.plot','error.heatmap')
+  return(model_summary)
+}
+
+
+# COVID19 serial interval (in days), as reported by Du Z, Xu X, Wu Y, Wang L, Cowling BJ, Ancel Meyers L. Serial interval of COVID-19 among publicly reported confirmed cases. Emerg Infect Dis. 2020 Jun [date cited].
+# mean SI (mu) = 3.96 
+# SD SI (sigma) = 4.75
+
+
+# load daily incidence data
+nyc = read.delim('https://raw.githubusercontent.com/nychealth/coronavirus-data/master/latest/now-data-by-day.csv', sep = ',')
+nyc_i = data.frame(dates = as.Date(nyc$date_of_interest, format = '%m/%d/%Y'), I = nyc$CASE_COUNT)
+
+# remove last two days of data due to possible incomplete values
+nyc_i = nyc_i[nyc_i$dates < Sys.Date()-1,]
+
+nyc_i = as.incidence(nyc_i$I, dates = nyc_i$dates) # convert to incidence object for downstream analysis
+
+# estimate model
+nyc_model = estimate_model(nyc_i)
+
+```
+
+```{r, fig.width=10, fig.height=5}
+nyc_model$incidence.plot + theme_minimal()
+```
+
+```{r, fig.width=10, fig.height=5}
+# estimate R
+nyc_model$r.plot + theme_minimal()
+```
+
+### Projected SARS-CoV-2 Positive Cases in NYC
+```{r, fig.width=10, fig.height=10}
+nyc_model$pred.plot + theme_minimal()
+```
+
+### Model Accuracy
+```{r, fig.width=25, fig.height=4}
+nyc_model$error.heatmap
+
+```
